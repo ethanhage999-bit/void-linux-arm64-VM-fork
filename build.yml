@@ -3,23 +3,34 @@ name: Build voidarm64 ISO
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:        # lets you trigger it manually from GitHub UI
+  workflow_dispatch:
 
 jobs:
   build:
     name: Build voidarm64 + Hyprland ISO
-    runs-on: ubuntu-24.04-arm  # native ARM64 runner — no QEMU emulation needed
+    runs-on: ubuntu-24.04-arm
 
     permissions:
-      contents: write        # needed to upload the release artifact
+      contents: write
 
     steps:
 
-    # ── 1. Checkout repo ──────────────────────────────────────────────────────
+    # ── 1. Checkout ───────────────────────────────────────────────────────────
     - name: Checkout
       uses: actions/checkout@v4
 
-    # ── 2. Install build dependencies ────────────────────────────────────────
+    # ── 2. Confirm ARM64 and show environment ─────────────────────────────────
+    - name: Debug environment
+      run: |
+        echo "Architecture: $(uname -m)"
+        echo "OS: $(uname -a)"
+        echo "Disk space:"
+        df -h /
+        echo "Working directory: $(pwd)"
+        echo "Repo contents:"
+        find . -type f | sort
+
+    # ── 3. Install build dependencies ────────────────────────────────────────
     - name: Install dependencies
       run: |
         sudo apt-get update -qq
@@ -34,39 +45,66 @@ jobs:
           curl \
           xz-utils \
           rsync \
+          openssl \
           qemu-utils
+        echo "All dependencies installed"
 
-    # ── 3. Install xbps static binaries ──────────────────────────────────────
-    - name: Install xbps
+    # ── 4. Install xbps ───────────────────────────────────────────────────────
+    - name: Install xbps static binaries
       run: |
+        set -euo pipefail
         XBPS_URL="https://repo-default.voidlinux.org/static/xbps-static-latest.aarch64-musl.tar.xz"
-        curl -fsSL "$XBPS_URL" -o /tmp/xbps-static.tar.xz
+        echo "Downloading xbps from: $XBPS_URL"
+        curl -fsSL --retry 3 "$XBPS_URL" -o /tmp/xbps-static.tar.xz
+        echo "Download complete, extracting..."
         mkdir -p /tmp/xbps-static
         tar xf /tmp/xbps-static.tar.xz -C /tmp/xbps-static
-        sudo install -m755 $(find /tmp/xbps-static -name 'xbps-install.static')    /usr/local/bin/xbps-install
-        sudo install -m755 $(find /tmp/xbps-static -name 'xbps-query.static')      /usr/local/bin/xbps-query
-        sudo install -m755 $(find /tmp/xbps-static -name 'xbps-reconfigure.static') /usr/local/bin/xbps-reconfigure
-        sudo install -m755 $(find /tmp/xbps-static -name 'xbps-remove.static')     /usr/local/bin/xbps-remove
+        echo "Extracted files:"
+        find /tmp/xbps-static -type f | head -20
+        # Install each binary
+        for bin in xbps-install xbps-query xbps-reconfigure xbps-remove xbps-rindex; do
+          FOUND=$(find /tmp/xbps-static -name "${bin}.static" 2>/dev/null | head -1)
+          if [ -n "$FOUND" ]; then
+            sudo install -m755 "$FOUND" /usr/local/bin/${bin}
+            echo "Installed: ${bin}"
+          else
+            echo "WARNING: ${bin}.static not found"
+          fi
+        done
+        echo "Verifying xbps-install:"
+        which xbps-install
         xbps-install --version
 
-    # ── 4. Build rootfs ───────────────────────────────────────────────────────
-    - name: Build Void Linux ARM64 rootfs
-      run: sudo bash scripts/build-rootfs.sh
+    # ── 5. Build rootfs ───────────────────────────────────────────────────────
+    - name: Build rootfs
+      run: |
+        set -euo pipefail
+        chmod +x scripts/build-rootfs.sh
+        sudo --preserve-env=PATH bash scripts/build-rootfs.sh
+      env:
+        PATH: /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
-    # ── 5. Build ISO ──────────────────────────────────────────────────────────
-    - name: Build bootable ISO
-      run: sudo bash scripts/build-iso.sh
+    # ── 6. Build ISO ──────────────────────────────────────────────────────────
+    - name: Build ISO
+      run: |
+        set -euo pipefail
+        chmod +x scripts/build-iso.sh
+        sudo --preserve-env=PATH bash scripts/build-iso.sh
+        echo "ISO built:"
+        ls -lh output/
+      env:
+        PATH: /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
-    # ── 6. Upload ISO as release artifact ────────────────────────────────────
+    # ── 7. Upload artifact ────────────────────────────────────────────────────
     - name: Upload ISO artifact
       uses: actions/upload-artifact@v4
       with:
         name: voidarm64-hyprland
         path: output/voidarm64-hyprland.iso
-        retention-days: 7     # artifact stays available for 7 days to download
+        retention-days: 7
 
-    # ── 7. Also create a GitHub Release with the ISO attached ─────────────────
-    - name: Create GitHub Release
+    # ── 8. Create GitHub Release ──────────────────────────────────────────────
+    - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
         tag_name: build-${{ github.run_number }}
@@ -76,19 +114,18 @@ jobs:
 
           Auto-built ISO for ARM64 UTM on Apple Silicon.
 
-          ### How to use
+          ### How to boot in UTM
           1. Download `voidarm64-hyprland.iso` below
           2. UTM → **+** → **Virtualize** → **Linux** → select this ISO
-          3. Memory: 4096MB · CPUs: 4
-          4. Display: `virtio-gpu-gl-pci`
-          5. Boot → install → log in as `void` / `voidarm64`
-          6. Hyprland starts automatically on tty1
+          3. Memory: `4096 MB` · CPU Cores: `4`
+          4. Display card: **`virtio-gpu-gl-pci`** ← required
+          5. Boot → log in as `void` / `voidarm64`
+          6. Hyprland starts automatically
 
-          ### Build info
-          - Base: Void Linux aarch64 glibc
-          - Compositor: Hyprland (Wayland)
-          - Init: runit
-          - Built: ${{ github.run_id }}
+          ### Stack
+          - Base: Void Linux aarch64 glibc · Init: runit
+          - Compositor: Hyprland · Bar: Waybar · Terminal: foot
+          - Audio: PipeWire · Network: NetworkManager
         files: output/voidarm64-hyprland.iso
         draft: false
         prerelease: false
